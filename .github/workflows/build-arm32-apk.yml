@@ -2,6 +2,8 @@ name: Build custom ARM32 APK
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -17,7 +19,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ARCHIVE="tg-ws-proxy-custom-1.2.4-source.zip"
+          ARCHIVE="tg-ws-proxy-custom-source.zip"
           test -f "$ARCHIVE" || { echo "Upload $ARCHIVE to the repository root first."; exit 1; }
           unzip -q "$ARCHIVE" -d source
           ROOT="$(find source -mindepth 1 -maxdepth 1 -type d | head -n1)"
