@@ -1,0 +1,68 @@
+name: Build custom ARM32 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify and unpack source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="tg-ws-proxy-custom-1.2.4-source.zip"
+          test -f "$ARCHIVE" || { echo "Upload $ARCHIVE to the repository root first."; exit 1; }
+          unzip -q "$ARCHIVE" -d source
+          ROOT="$(find source -mindepth 1 -maxdepth 1 -type d | head -n1)"
+          test -n "$ROOT"
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE/$ROOT" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and NDK
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.1.0'
+
+      - name: Set up Rust for Android ARM32
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build Rust native library
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: cargo ndk -t armeabi-v7a --platform 21 -o app/src/main/jniLibs build --release
+
+      - name: Build signed ARM32 APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon assembleArm32Release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tg-ws-proxy-custom-arm32
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/arm32/release/*.apk
+          if-no-files-found: error
