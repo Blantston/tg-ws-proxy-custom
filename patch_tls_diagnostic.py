@@ -1,54 +1,256 @@
 #!/usr/bin/env python3
-"""Apply the TLS 1.2 compatibility/timeout diagnostic patch to the unpacked source."""
+"""Install phase-specific Cloudflare connect diagnostics in the Android source tree."""
 from pathlib import Path
 import sys
 
 if len(sys.argv) != 2:
-    raise SystemExit("usage: patch_tls_diagnostic.py path/to/src/ws.rs")
+    raise SystemExit("usage: patch_tls_diagnostic.py path/to/project/root")
 
-path = Path(sys.argv[1])
-source = path.read_text(encoding="utf-8")
+root = Path(sys.argv[1])
+config = root / "src/config.rs"
+ws = root / "src/ws.rs"
+cf = root / "src/cfproxy.rs"
+proxy = root / "src/proxy.rs"
 
-old_tls = """    let mut cfg = ClientConfig::builder()
+
+def replace_once(path: Path, old: str, new: str, label: str) -> None:
+    source = path.read_text(encoding="utf-8")
+    if new in source:
+        return
+    count = source.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected one source anchor in {path}, found {count}")
+    path.write_text(source.replace(old, new, 1), encoding="utf-8")
+
+
+replace_once(
+    config,
+    'pub const CFPROXY_DIAL_PHASE_TIMEOUT: Duration = Duration::from_secs(4);',
+    '''pub const CFPROXY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(12);
+pub const CFPROXY_TCP_TIMEOUT: Duration = Duration::from_secs(4);
+pub const CFPROXY_TLS_TIMEOUT: Duration = Duration::from_secs(8);
+pub const CFPROXY_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const CFPROXY_HTTP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);''',
+    "Cloudflare timeout constants",
+)
+
+replace_once(ws, 'use std::time::Duration;', 'use std::time::{Duration, Instant};', "ws timing import")
+
+replace_once(
+    ws,
+    '''    let mut cfg = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();"""
-new_tls = """    // Diagnostic compatibility profile: TCP connects, but TLS stalls on both
-    // Wi-Fi and mobile. Force TLS 1.2 to rule out TLS 1.3 interoperability issues.
-    let mut cfg = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+        .with_no_client_auth();
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);''',
+    '''    let mut cfg = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();"""
+        .with_no_client_auth();
+    // The proxy uses an HTTP/1.1 Upgrade request after TLS.
+    // Keep TLS 1.2 and 1.3 enabled; advertise only the matching ALPN protocol.
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);''',
+    "TLS ALPN profile",
+)
 
-old_timeout = """pub fn ws_handshake_timeout(total: Duration) -> Duration {
-    if total <= Duration::ZERO {
-        Duration::from_secs(3)
-    } else if total > Duration::from_secs(3) {
-        Duration::from_secs(3)
-    } else {
-        total
+replace_once(
+    ws,
+    '''    TimeoutAt(&'static str),
+    /// Hostname attempt followed by one or more explicit-IP attempts.''',
+    '''    TimeoutAt(&'static str),
+    /// A timed-out phase with its measured elapsed time in milliseconds.
+    TimeoutAtElapsed(&'static str, u128),
+    /// Hostname attempt followed by one or more explicit-IP attempts.''',
+    "elapsed timeout error variant",
+)
+replace_once(
+    ws,
+    '''            WsError::TimeoutAt(phase) => format!("timeout({})", phase),
+            WsError::Fallback''',
+    '''            WsError::TimeoutAt(phase) => format!("timeout({})", phase),
+            WsError::TimeoutAtElapsed(phase, ms) => format!("timeout({}:{}ms)", phase, ms),
+            WsError::Fallback''',
+    "elapsed timeout formatting",
+)
+
+replace_once(
+    ws,
+    '''pub async fn ws_connect_once(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<RawWebSocket, WsError> {
+    if dial_addr.is_empty() {''',
+    '''pub async fn ws_connect_once(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<RawWebSocket, WsError> {
+    let tls_timeout = ws_handshake_timeout(timeout);
+    ws_connect_once_with_phase_timeouts(
+        dial_addr, domain, path, timeout, tls_timeout, timeout, timeout,
+    ).await
+}
+
+pub async fn ws_connect_once_with_phase_timeouts(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    tcp_timeout: Duration,
+    tls_timeout: Duration,
+    http_write_timeout: Duration,
+    http_response_timeout: Duration,
+) -> Result<RawWebSocket, WsError> {
+    if dial_addr.is_empty() {''',
+    "phase timeout wrapper",
+)
+
+replace_once(
+    ws,
+    '''    let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(WsError::Io(e)),
+        Err(_) => return Err(WsError::TimeoutAt("tcp")),
+    };''',
+    '''    let tcp_started = Instant::now();
+    let raw_conn = match tokio::time::timeout(tcp_timeout, TcpStream::connect(&target_addr)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(WsError::Io(e)),
+        Err(_) => return Err(WsError::TimeoutAtElapsed("tcp", tcp_started.elapsed().as_millis())),
+    };''',
+    "TCP phase timeout",
+)
+replace_once(
+    ws,
+    '''    let handshake_timeout = ws_handshake_timeout(timeout);
+    let tls_conn =
+        match tokio::time::timeout(handshake_timeout, connector.connect(sni, raw_conn)).await {''',
+    '''    let tls_started = Instant::now();
+    let tls_conn =
+        match tokio::time::timeout(tls_timeout, connector.connect(sni, raw_conn)).await {''',
+    "TLS phase timeout",
+)
+replace_once(
+    ws,
+    '''                return Err(WsError::TimeoutAt("tls"));''',
+    '''                return Err(WsError::TimeoutAtElapsed("tls", tls_started.elapsed().as_millis()));''',
+    "TLS elapsed report",
+)
+replace_once(
+    ws,
+    '''    match tokio::time::timeout(timeout, write_half.write_all(req.as_bytes())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(WsError::Io(e)),
+        Err(_) => return Err(WsError::TimeoutAt("http-write")),
+    }''',
+    '''    let http_write_started = Instant::now();
+    match tokio::time::timeout(http_write_timeout, write_half.write_all(req.as_bytes())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(WsError::Io(e)),
+        Err(_) => return Err(WsError::TimeoutAtElapsed("http-write", http_write_started.elapsed().as_millis())),
+    }''',
+    "HTTP write phase timeout",
+)
+replace_once(
+    ws,
+    '''    let read_result = tokio::time::timeout(timeout, async {''',
+    '''    let http_response_started = Instant::now();
+    let read_result = tokio::time::timeout(http_response_timeout, async {''',
+    "HTTP response phase timeout",
+)
+replace_once(
+    ws,
+    '''        Err(_) => return Err(WsError::TimeoutAt("http-response")),''',
+    '''        Err(_) => return Err(WsError::TimeoutAtElapsed("http-response", http_response_started.elapsed().as_millis())),''',
+    "HTTP response elapsed report",
+)
+
+replace_once(
+    cf,
+    'use crate::ws::{is_http_status_error, ws_connect_once, RawWebSocket, WsError};',
+    'use crate::ws::{is_http_status_error, ws_connect_once_with_phase_timeouts, RawWebSocket, WsError};',
+    "Cloudflare ws import",
+)
+
+old_cf_timeout_helper = '''fn new_timed_attempt_timeout(base: Duration, phase: Duration) -> Duration {
+    let mut eff = base;
+    if eff <= Duration::ZERO {
+        eff = Duration::from_secs(5);
     }
-}"""
-new_timeout = """pub fn ws_handshake_timeout(total: Duration) -> Duration {
-    // Allow slow mobile handshakes; keep the timeout bounded at 8 seconds.
-    if total <= Duration::ZERO {
-        Duration::from_secs(8)
-    } else if total > Duration::from_secs(8) {
-        Duration::from_secs(8)
-    } else {
-        total
+    if eff > phase {
+        eff = phase;
     }
-}"""
+    eff
+}
 
-if new_tls not in source:
-    if old_tls not in source:
-        raise SystemExit("TLS config anchor not found; refusing to patch unknown source")
-    source = source.replace(old_tls, new_tls, 1)
+'''
+source = cf.read_text(encoding="utf-8")
+if old_cf_timeout_helper in source:
+    cf.write_text(source.replace(old_cf_timeout_helper, "", 1), encoding="utf-8")
 
-if new_timeout not in source:
-    if old_timeout not in source:
-        raise SystemExit("TLS timeout anchor not found; refusing to patch unknown source")
-    source = source.replace(old_timeout, new_timeout, 1)
+replace_once(
+    cf,
+    '''pub async fn cf_connect_domain(
+    domain: &str,
+    path: &str,
+    timeout: f64,
+) -> (Option<RawWebSocket>, String, Option<WsError>) {
+    let path = if path.is_empty() { "/apiws" } else { path };
 
-path.write_text(source, encoding="utf-8")
-print("Applied TLS 1.2-only profile and 8-second handshake timeout.")
+    let attempt_timeout = crate::ws::ws_connect_timeout(timeout);
+    let phase_timeout = attempt_timeout.min(CFPROXY_DIAL_PHASE_TIMEOUT);
+
+    match ws_connect_once(domain, domain, path, phase_timeout).await {''',
+    '''async fn cf_ws_attempt(
+    dial_addr: &str,
+    domain: &str,
+    path: &str,
+    total_timeout: Duration,
+) -> Result<RawWebSocket, WsError> {
+    let tcp_timeout = total_timeout.min(CFPROXY_TCP_TIMEOUT);
+    let tls_timeout = total_timeout.min(CFPROXY_TLS_TIMEOUT);
+    let http_write_timeout = total_timeout.min(CFPROXY_HTTP_WRITE_TIMEOUT);
+    let http_response_timeout = total_timeout.min(CFPROXY_HTTP_RESPONSE_TIMEOUT);
+    let started = Instant::now();
+    match tokio::time::timeout(
+        total_timeout,
+        ws_connect_once_with_phase_timeouts(
+            dial_addr, domain, path,
+            tcp_timeout, tls_timeout, http_write_timeout, http_response_timeout,
+        ),
+    ).await {
+        Ok(result) => result,
+        Err(_) => Err(WsError::TimeoutAtElapsed("total", started.elapsed().as_millis())),
+    }
+}
+
+pub async fn cf_connect_domain(
+    domain: &str,
+    path: &str,
+    timeout: f64,
+) -> (Option<RawWebSocket>, String, Option<WsError>) {
+    let path = if path.is_empty() { "/apiws" } else { path };
+
+    let attempt_timeout = crate::ws::ws_connect_timeout(timeout).min(CFPROXY_ATTEMPT_TIMEOUT);
+
+    match cf_ws_attempt(domain, domain, path, attempt_timeout).await {''',
+    "Cloudflare phase-aware attempt helper",
+)
+replace_once(
+    cf,
+    '''                let result = ws_connect_once(&ip, &domain, &path, phase_timeout).await;''',
+    '''                let result = cf_ws_attempt(&ip, &domain, &path, attempt_timeout).await;''',
+    "Cloudflare IP phase-aware attempt",
+)
+
+replace_once(
+    proxy,
+    'let (ws, resolved_ip, err) = cf_connect_domain(&domain, "/apiws", 5.0).await;',
+    'let (ws, resolved_ip, err) = cf_connect_domain(&domain, "/apiws", 12.0).await;',
+    "Cloudflare attempt budget caller",
+)
+
+print("Applied phase-specific CF timeouts (TCP 4s / TLS 8s / HTTP write 3s / HTTP response 5s; total 12s), elapsed-phase errors, and TLS 1.2/1.3 + ALPN http/1.1 profile.")
