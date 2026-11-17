@@ -263,7 +263,7 @@ cargo_text = cargo_text.replace(
     'tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }',
 )
 cargo_text = cargo_text.replace(
-    'rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }',
+    'rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }',
     'rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }',
 )
 cargo.write_text(cargo_text, encoding="utf-8")
@@ -282,6 +282,7 @@ old_tls = '''static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
     Arc::new(cfg)
 });'''
