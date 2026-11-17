@@ -219,7 +219,7 @@ replace_once(
         total_timeout,
         ws_connect_once_with_phase_timeouts(
             dial_addr, domain, path,
-            tcp_timeout, tls_timeout, http_write_timeout, http_response_timeout,
+            tcp_timeout, tls_timeout, http_write_timeout, http_response_timeout, domain,
         ),
     ).await {
         Ok(result) => result,
