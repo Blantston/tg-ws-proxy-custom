@@ -253,4 +253,128 @@ replace_once(
     "Cloudflare attempt budget caller",
 )
 
+
+# Experimental ECH path: fetch HTTPS RR over DoH, then use rustls client-side ECH.
+# AWS-LC is required because rustls' ring provider does not implement HPKE.
+cargo = root / "Cargo.toml"
+cargo_text = cargo.read_text(encoding="utf-8")
+cargo_text = cargo_text.replace(
+    'tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }',
+    'tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }',
+)
+cargo_text = cargo_text.replace(
+    'rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }',
+    'rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }',
+)
+cargo.write_text(cargo_text, encoding="utf-8")
+
+source = ws.read_text(encoding="utf-8")
+source = source.replace(
+    'use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};',
+    'use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};\nuse rustls::client::{EchConfig, EchMode};',
+)
+source = source.replace(
+    'use rustls_pki_types::{CertificateDer, ServerName, UnixTime};',
+    'use rustls_pki_types::{CertificateDer, EchConfigListBytes, ServerName, UnixTime};',
+)
+old_tls = '''static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+    let mut cfg = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
+    Arc::new(cfg)
+});'''
+new_tls = '''static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut cfg = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("AWS-LC TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
+    Arc::new(cfg)
+});
+
+static ECH_TLS_CACHE: Lazy<tokio::sync::Mutex<HashMap<String, Arc<ClientConfig>>>> =
+    Lazy::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+async fn ech_tls_config(domain: &str) -> Option<Arc<ClientConfig>> {
+    if let Some(cached) = ECH_TLS_CACHE.lock().await.get(domain).cloned() {
+        return Some(cached);
+    }
+
+    // HTTPS RR (type 65) carries the ECHConfigList. Use DoH so the lookup itself
+    // does not disclose the target hostname to the mobile operator's DNS.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let response = client
+        .get("https://cloudflare-dns.com/dns-query")
+        .query(&[("name", domain), ("type", "HTTPS")])
+        .header("accept", "application/dns-json")
+        .send()
+        .await
+        .ok()?;
+    let json: serde_json::Value = response.json().await.ok()?;
+    let answers = json.get("Answer")?.as_array()?;
+
+    for answer in answers {
+        if answer.get("type").and_then(|v| v.as_u64()) != Some(65) {
+            continue;
+        }
+        let data = answer.get("data").and_then(|v| v.as_str())?;
+        for token in data.split_ascii_whitespace() {
+            let Some(value) = token.strip_prefix("ech=") else { continue };
+            let encoded = value.trim_matches('"').trim_matches('\\'');
+            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+            let ech_list = EchConfigListBytes::from(bytes);
+            let ech = EchConfig::new(
+                ech_list,
+                rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+            ).ok()?;
+
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let mut cfg = ClientConfig::builder_with_provider(provider)
+                .with_ech(EchMode::from(ech))
+                .ok()?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth();
+            cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+            cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
+            let cfg = Arc::new(cfg);
+            ECH_TLS_CACHE.lock().await.insert(domain.to_string(), cfg.clone());
+            return Some(cfg);
+        }
+    }
+    None
+}
+
+async fn tls_connector_for_domain(domain: &str) -> TlsConnector {
+    match ech_tls_config(domain).await {
+        Some(cfg) => {
+            ldebug!("ECH enabled for {}", domain);
+            TlsConnector::from(cfg)
+        }
+        None => {
+            ldebug!("ECH unavailable for {}, using regular TLS", domain);
+            TlsConnector::from(TLS_CONFIG.clone())
+        }
+    }
+}'''
+if new_tls not in source:
+    if old_tls not in source:
+        raise SystemExit("TLS_CONFIG anchor not found")
+    source = source.replace(old_tls, new_tls, 1)
+source = source.replace(
+    'let connector = TlsConnector::from(TLS_CONFIG.clone());',
+    'let connector = tls_connector_for_domain(domain).await;',
+)
+ws.write_text(source, encoding="utf-8")
+print("Applied experimental ECH path: HTTPS RR lookup via Cloudflare DoH, rustls ECH with AWS-LC HPKE, regular TLS fallback.")
+
 print("Applied phase-specific CF timeouts (TCP 4s / TLS 8s / HTTP write 3s / HTTP response 5s; total 12s), elapsed-phase errors, and TLS 1.2/1.3 + ALPN http/1.1 profile.")
