@@ -24,6 +24,7 @@ jobs:
           unzip -q "$ARCHIVE" -d source
           ROOT="$(find source -mindepth 1 -maxdepth 1 -type d | head -n1)"
           test -n "$ROOT"
+          python3 "$GITHUB_WORKSPACE/patch_tls_diagnostic.py" "$ROOT/src/ws.rs"
           echo "PROJECT_DIR=$GITHUB_WORKSPACE/$ROOT" >> "$GITHUB_ENV"
 
       - name: Set up JDK 17
