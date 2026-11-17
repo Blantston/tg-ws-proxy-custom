@@ -31,6 +31,7 @@ jobs:
           echo "=== Cargo and TLS source ==="
           grep -nE 'rustls|tokio-rustls|reqwest|base64' "$ROOT/Cargo.toml" || true
           python3 "$GITHUB_WORKSPACE/patch_tls_diagnostic.py" "$ROOT"
+          python3 "$GITHUB_WORKSPACE/patch_fronting_logs.py" "$ROOT"
           echo "PROJECT_DIR=$GITHUB_WORKSPACE/$ROOT" >> "$GITHUB_ENV"
 
       - name: Set up JDK 17
