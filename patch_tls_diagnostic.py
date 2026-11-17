@@ -282,6 +282,8 @@ old_tls = '''static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
+    // The proxy uses an HTTP/1.1 Upgrade request after TLS.
+    // Keep TLS 1.2 and 1.3 enabled; advertise only the matching ALPN protocol.
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
     Arc::new(cfg)
