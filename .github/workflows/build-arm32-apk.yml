@@ -25,7 +25,7 @@ jobs:
           ROOT="$(find source -mindepth 1 -maxdepth 1 -type d | head -n1)"
           test -n "$ROOT"
           echo "=== Kotlin UI files and log-console candidates ==="
-          find "$ROOT" -type f \\( -name '*.kt' -o -name '*.xml' \\) -print
+          find "$ROOT" -type f \( -name '*.kt' -o -name '*.xml' \) -print
           echo "=== Candidate console/log UI source snippets ==="
           grep -RInE -C 4 'console|logText|logs|LazyColumn|TextField|verticalScroll|heightIn|weight\(' "$ROOT" --include='*.kt' --include='*.xml' | head -n 500 || true
           echo "=== Cargo and TLS source ==="
