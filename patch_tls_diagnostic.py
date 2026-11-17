@@ -306,6 +306,8 @@ async fn ech_tls_config(domain: &str) -> Option<Arc<ClientConfig>> {
         return Some(cached);
     }
 
+    // Ensure reqwest and the proxy use the same explicitly selected AWS-LC provider.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // HTTPS RR (type 65) carries the ECHConfigList. Use DoH so the lookup itself
     // does not disclose the target hostname to the mobile operator's DNS.
     let client = reqwest::Client::builder()
@@ -329,7 +331,7 @@ async fn ech_tls_config(domain: &str) -> Option<Arc<ClientConfig>> {
         let data = answer.get("data").and_then(|v| v.as_str())?;
         for token in data.split_ascii_whitespace() {
             let Some(value) = token.strip_prefix("ech=") else { continue };
-            let encoded = value.trim_matches('"').trim_matches('\\'');
+            let encoded = value.trim_matches('"').trim_matches('\'');
             let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
             let ech_list = EchConfigListBytes::from(bytes);
             let ech = EchConfig::new(
