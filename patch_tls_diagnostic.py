@@ -331,7 +331,7 @@ async fn ech_tls_config(domain: &str) -> Option<Arc<ClientConfig>> {
         let data = answer.get("data").and_then(|v| v.as_str())?;
         for token in data.split_ascii_whitespace() {
             let Some(value) = token.strip_prefix("ech=") else { continue };
-            let encoded = value.trim_matches('"').trim_matches('\'');
+            let encoded = value.trim_matches('"').trim_matches('\\'');
             let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
             let ech_list = EchConfigListBytes::from(bytes);
             let ech = EchConfig::new(
