@@ -22,7 +22,7 @@ button = """                TextButton(onClick = {
                     scope.launch {
                         diagnosticsRunning = true
                         Log.i(\"TgWsProxy\", \"[DIAG] User started on-device network diagnostics\")
-                        try { NetworkDiagnostics.run(context) }
+                        try { NetworkDiagnostics.run() }
                         catch (e: Exception) { Log.w(\"TgWsProxy\", \"[DIAG] Diagnostics failed: \" + e.javaClass.simpleName + \": \" + e.message) }
                         finally { diagnosticsRunning = false }
                     }
